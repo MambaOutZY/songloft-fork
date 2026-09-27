@@ -1,0 +1,351 @@
+diff --git a/lib/core/audio/audio_service.dart b/lib/core/audio/audio_service.dart
+index bdfbbc8..35aca91 100644
+--- a/lib/core/audio/audio_service.dart
++++ b/lib/core/audio/audio_service.dart
+@@ -41,6 +41,8 @@ class SongloftAudioHandler extends BaseAudioHandler with SeekHandler {
+ 
+   String? _originalTitle;
+   String? _originalArtist;
++  DateTime? _lastLyricPushTime;
++  String? _lastPushedLyric;
+ 
+   /// 最近一次 [playSong] 的播放来源（本地缓存 / 远端流串），供 PlayerNotifier 回填
+   /// 到 PlayerState，播放页「歌曲信息」据此展示。
+@@ -995,6 +997,8 @@ class SongloftAudioHandler extends BaseAudioHandler with SeekHandler {
+   void _updateNowPlaying(Song song) {
+     _originalTitle = song.title;
+     _originalArtist = song.artist ?? '未知艺术家';
++    _lastLyricPushTime = null;
++    _lastPushedLyric = null;
+ 
+     // artUri 由 Android 系统直接拉取，必须是带 baseUrl + access_token 的完整 URL。
+     // 传 ?w= 缩略，避免系统每首歌拉全尺寸封面加剧 NAS 拥堵（songloft-org/songloft-player#39）。
+@@ -1040,6 +1044,19 @@ class SongloftAudioHandler extends BaseAudioHandler with SeekHandler {
+       return;
+     }
+ 
++    // 避免重复推送相同歌词行
++    if (_lastPushedLyric == lyricLine) return;
++
++    // 限频节流：最小推送间隔 800ms，防止瞬时密集跳行冲击车载蓝牙与系统通知
++    final now = DateTime.now();
++    if (_lastLyricPushTime != null &&
++        now.difference(_lastLyricPushTime!).inMilliseconds < 800) {
++      return;
++    }
++
++    _lastLyricPushTime = now;
++    _lastPushedLyric = lyricLine;
++
+     if (inTitle) {
+       final artist =
+           _originalArtist?.isNotEmpty == true
+@@ -1056,6 +1073,7 @@ class SongloftAudioHandler extends BaseAudioHandler with SeekHandler {
+ 
+   /// 恢复 Now Playing 元数据为原始歌曲信息
+   void restoreNowPlaying() {
++    _lastPushedLyric = null;
+     final current = mediaItem.value;
+     if (current == null || _originalTitle == null) return;
+     mediaItem.add(
+diff --git a/lib/core/storage/app_preferences.dart b/lib/core/storage/app_preferences.dart
+index dd6a696..6325438 100644
+--- a/lib/core/storage/app_preferences.dart
++++ b/lib/core/storage/app_preferences.dart
+@@ -465,6 +465,21 @@ class AppPreferences {
+     return _prefs.setBool(_autoEnterLyricsOnLaunchKey, value);
+   }
+ 
++  static const _notificationLyricEnabledKey =
++      'player_notification_lyric_enabled';
++
++  /// 系统媒体通知与车载蓝牙歌词推送开关（默认关闭，参考 lx-music-mobile 设计，避免蓝牙车载卡顿）。
++  /// 开启：每句歌词同步更新到 MediaSession / 通知栏；
++  /// 关闭：通知栏与车载蓝牙只保留固定歌曲名和歌手，不频繁更新媒体元数据。
++  /// 纯本地设置，不参与服务器偏好同步。
++  bool getNotificationLyricEnabled() {
++    return _prefs.getBool(_notificationLyricEnabledKey) ?? false;
++  }
++
++  Future<bool> setNotificationLyricEnabled(bool value) {
++    return _prefs.setBool(_notificationLyricEnabledKey, value);
++  }
++
+   static const _notificationLyricInTitleKey =
+       'player_notification_lyric_in_title';
+ 
+diff --git a/lib/features/player/presentation/providers/lyric_provider.dart b/lib/features/player/presentation/providers/lyric_provider.dart
+index 5f1e809..0c0300a 100644
+--- a/lib/features/player/presentation/providers/lyric_provider.dart
++++ b/lib/features/player/presentation/providers/lyric_provider.dart
+@@ -103,13 +103,32 @@ class LyricNotifier extends Notifier<LyricState> {
+       _updateCurrentLine(next);
+     });
+ 
+-    // 通知栏歌词显示位置切换时，若当前有歌词行则用新模式立即重推一次（即时生效，无需切歌）
++    // 系统媒体通知与车载蓝牙歌词总开关切换
++    ref.listen(notificationLyricEnabledProvider, (prev, next) {
++      if (next) {
++        final text = state.currentLyricText;
++        if (text.isNotEmpty) {
++          ref
++              .read(audioHandlerProvider)
++              .updateNowPlayingLyric(
++                text,
++                inTitle: ref.read(notificationLyricInTitleProvider),
++              );
++        }
++      } else {
++        ref.read(audioHandlerProvider).restoreNowPlaying();
++      }
++    });
++
++    // 通知栏歌词显示位置切换时，若已启用推送且当前有歌词行则用新模式立即重推一次（即时生效，无需切歌）
+     ref.listen(notificationLyricInTitleProvider, (prev, next) {
+-      final text = state.currentLyricText;
+-      if (text.isNotEmpty) {
+-        ref
+-            .read(audioHandlerProvider)
+-            .updateNowPlayingLyric(text, inTitle: next);
++      if (ref.read(notificationLyricEnabledProvider)) {
++        final text = state.currentLyricText;
++        if (text.isNotEmpty) {
++          ref
++              .read(audioHandlerProvider)
++              .updateNowPlayingLyric(text, inTitle: next);
++        }
+       }
+     });
+ 
+@@ -136,12 +155,14 @@ class LyricNotifier extends Notifier<LyricState> {
+         state.currentLyricText,
+         state.nextLyricText,
+       );
+-      ref
+-          .read(audioHandlerProvider)
+-          .updateNowPlayingLyric(
+-            state.currentLyricText,
+-            inTitle: ref.read(notificationLyricInTitleProvider),
+-          );
++      if (ref.read(notificationLyricEnabledProvider)) {
++        ref
++            .read(audioHandlerProvider)
++            .updateNowPlayingLyric(
++              state.currentLyricText,
++              inTitle: ref.read(notificationLyricInTitleProvider),
++            );
++      }
+     }
+   }
+ 
+diff --git a/lib/features/settings/presentation/providers/settings_provider.dart b/lib/features/settings/presentation/providers/settings_provider.dart
+index 183c764..c585e0d 100644
+--- a/lib/features/settings/presentation/providers/settings_provider.dart
++++ b/lib/features/settings/presentation/providers/settings_provider.dart
+@@ -1197,6 +1197,40 @@ final autoEnterLyricsOnLaunchProvider =
+       AutoEnterLyricsOnLaunchNotifier.new,
+     );
+ 
++/// 「系统媒体通知与车载蓝牙歌词推送」开关（纯本地，不同步服务器）。
++/// 默认关闭（参考 lx-music-mobile）：避免部分车载蓝牙（如君越等车型）因高频 AVRCP 元数据更新导致界面卡顿。
++class NotificationLyricEnabledNotifier extends Notifier<bool> {
++  @override
++  bool build() {
++    _load();
++    return false;
++  }
++
++  Future<void> _load() async {
++    try {
++      final prefs = await ref.read(appPreferencesProvider.future);
++      state = prefs.getNotificationLyricEnabled();
++    } catch (_) {
++      state = false;
++    }
++  }
++
++  Future<void> setEnabled(bool value) async {
++    state = value;
++    try {
++      final prefs = await ref.read(appPreferencesProvider.future);
++      await prefs.setNotificationLyricEnabled(value);
++      // 注意：本地设置，刻意不调用 pushPreferencesToServer
++    } catch (_) {}
++  }
++}
++
++/// 系统媒体通知与车载蓝牙歌词推送 Provider
++final notificationLyricEnabledProvider =
++    NotifierProvider<NotificationLyricEnabledNotifier, bool>(
++      NotificationLyricEnabledNotifier.new,
++    );
++
+ /// 「系统媒体通知里歌词显示在标题行」开关（纯本地，不同步服务器）。
+ /// 开启（默认）：标题=歌词、副标题="歌名 - 艺术家"；关闭：标题=歌名、副标题=纯歌词。
+ class NotificationLyricInTitleNotifier extends Notifier<bool> {
+diff --git a/lib/features/settings/presentation/widgets/settings_category_content.dart b/lib/features/settings/presentation/widgets/settings_category_content.dart
+index fcb8a96..58cfdf1 100644
+--- a/lib/features/settings/presentation/widgets/settings_category_content.dart
++++ b/lib/features/settings/presentation/widgets/settings_category_content.dart
+@@ -494,6 +494,7 @@ class _SettingsCategoryContentState
+           l10n.settingsMiniPlayerControlsPrevNextMode,
+     };
+     final autoEnterLyrics = ref.watch(autoEnterLyricsOnLaunchProvider);
++    final notificationLyricEnabled = ref.watch(notificationLyricEnabledProvider);
+     final lyricInTitle = ref.watch(notificationLyricInTitleProvider);
+     final desktopLyricEnabled = ref.watch(desktopLyricEnabledProvider);
+     final desktopLyricLocked = ref.watch(desktopLyricLockedProvider);
+@@ -642,16 +643,29 @@ class _SettingsCategoryContentState
+             },
+           ),
+           const Divider(height: 1),
+-          // 系统媒体通知里歌词的显示位置（纯本地设置）
++          // 系统媒体通知与车载蓝牙歌词推送总开关（参考 lx-music-mobile，纯本地设置，默认关闭防卡顿）
+           SwitchListTile(
+-            secondary: const Icon(Icons.subtitles_outlined),
+-            title: Text(l10n.settingsNotificationLyricInTitleTitle),
+-            subtitle: Text(l10n.settingsNotificationLyricInTitleDesc),
+-            value: lyricInTitle,
++            secondary: const Icon(Icons.bluetooth_audio_outlined),
++            title: Text(l10n.settingsNotificationLyricEnabledTitle),
++            subtitle: Text(l10n.settingsNotificationLyricEnabledDesc),
++            value: notificationLyricEnabled,
+             onChanged: (v) {
+-              ref.read(notificationLyricInTitleProvider.notifier).setEnabled(v);
++              ref.read(notificationLyricEnabledProvider.notifier).setEnabled(v);
+             },
+           ),
++          if (notificationLyricEnabled) ...[
++            const Divider(height: 1),
++            // 系统媒体通知里歌词的显示位置（纯本地设置）
++            SwitchListTile(
++              secondary: const Icon(Icons.subtitles_outlined),
++              title: Text(l10n.settingsNotificationLyricInTitleTitle),
++              subtitle: Text(l10n.settingsNotificationLyricInTitleDesc),
++              value: lyricInTitle,
++              onChanged: (v) {
++                ref.read(notificationLyricInTitleProvider.notifier).setEnabled(v);
++              },
++            ),
++          ],
+           // 键盘快捷键（仅桌面）
+           if (PlatformUtils.isDesktop) ...[
+             const Divider(height: 1),
+diff --git a/lib/l10n/app_en.arb b/lib/l10n/app_en.arb
+index 2a51c34..f9608ee 100644
+--- a/lib/l10n/app_en.arb
++++ b/lib/l10n/app_en.arb
+@@ -2108,6 +2108,8 @@
+   "settingsFontScaleExtraLarge": "XL",
+   "settingsAutoEnterLyricsOnLaunchTitle": "Open lyrics on launch",
+   "settingsAutoEnterLyricsOnLaunchDesc": "Automatically open the full-screen lyrics view when the app opens (adapts to screen size)",
++  "settingsNotificationLyricEnabledTitle": "Bluetooth & notification lyrics",
++  "settingsNotificationLyricEnabledDesc": "Push synchronized lyrics to notification and Bluetooth car audio. Turn off if car display lags",
+   "settingsNotificationLyricInTitleTitle": "Lyrics in the notification title",
+   "settingsNotificationLyricInTitleDesc": "On: the title line shows lyrics and the song name moves to the subtitle. Off: the title line shows the song name and lyrics move to the subtitle",
+   "settingsDesktopLyricTitle": "Desktop Lyrics",
+diff --git a/lib/l10n/app_es.arb b/lib/l10n/app_es.arb
+index a50a332..6c7266d 100644
+--- a/lib/l10n/app_es.arb
++++ b/lib/l10n/app_es.arb
+@@ -2144,6 +2144,8 @@
+   "settingsFontScaleExtraLarge": "XL",
+   "settingsAutoEnterLyricsOnLaunchTitle": "Abrir letras al iniciar",
+   "settingsAutoEnterLyricsOnLaunchDesc": "Abre automáticamente la vista de letras a pantalla completa al abrir la app (se adapta al tamaño de pantalla)",
++  "settingsNotificationLyricEnabledTitle": "Letras en Bluetooth y notificaciones",
++  "settingsNotificationLyricEnabledDesc": "Enviar letras sincronizadas a notificaciones y Bluetooth del coche. Desactivar si el coche tiene lag",
+   "settingsNotificationLyricInTitleTitle": "Letras en el título de la notificación",
+   "settingsNotificationLyricInTitleDesc": "Activado: la línea de título muestra las letras y el nombre de la canción pasa al subtítulo. Desactivado: el título muestra el nombre de la canción y las letras van al subtítulo",
+   "settingsDesktopLyricTitle": "Letras en escritorio",
+diff --git a/lib/l10n/app_localizations.dart b/lib/l10n/app_localizations.dart
+index 5799da8..952a736 100644
+--- a/lib/l10n/app_localizations.dart
++++ b/lib/l10n/app_localizations.dart
+@@ -6076,6 +6076,18 @@ abstract class AppLocalizations {
+   /// **'启动客户端后自动进入全屏歌词界面（按屏幕自动适配）'**
+   String get settingsAutoEnterLyricsOnLaunchDesc;
+ 
++  /// No description provided for @settingsNotificationLyricEnabledTitle.
++  ///
++  /// In zh, this message translates to:
++  /// **'车载蓝牙与系统通知歌词'**
++  String get settingsNotificationLyricEnabledTitle;
++
++  /// No description provided for @settingsNotificationLyricEnabledDesc.
++  ///
++  /// In zh, this message translates to:
++  /// **'向通知栏及连接的车载蓝牙等设备实时推送歌词。若连接车机播放时歌词卡顿，请保持关闭'**
++  String get settingsNotificationLyricEnabledDesc;
++
+   /// No description provided for @settingsNotificationLyricInTitleTitle.
+   ///
+   /// In zh, this message translates to:
+diff --git a/lib/l10n/app_localizations_en.dart b/lib/l10n/app_localizations_en.dart
+index 8659287..9458387 100644
+--- a/lib/l10n/app_localizations_en.dart
++++ b/lib/l10n/app_localizations_en.dart
+@@ -3494,6 +3494,14 @@ class AppLocalizationsEn extends AppLocalizations {
+   String get settingsAutoEnterLyricsOnLaunchDesc =>
+       'Automatically open the full-screen lyrics view when the app opens (adapts to screen size)';
+ 
++  @override
++  String get settingsNotificationLyricEnabledTitle =>
++      'Bluetooth & notification lyrics';
++
++  @override
++  String get settingsNotificationLyricEnabledDesc =>
++      'Push synchronized lyrics to notification and Bluetooth car audio. Turn off if car display lags';
++
+   @override
+   String get settingsNotificationLyricInTitleTitle =>
+       'Lyrics in the notification title';
+diff --git a/lib/l10n/app_localizations_es.dart b/lib/l10n/app_localizations_es.dart
+index f90bfe3..eb94b1c 100644
+--- a/lib/l10n/app_localizations_es.dart
++++ b/lib/l10n/app_localizations_es.dart
+@@ -3542,6 +3542,14 @@ class AppLocalizationsEs extends AppLocalizations {
+   String get settingsAutoEnterLyricsOnLaunchDesc =>
+       'Abre automáticamente la vista de letras a pantalla completa al abrir la app (se adapta al tamaño de pantalla)';
+ 
++  @override
++  String get settingsNotificationLyricEnabledTitle =>
++      'Letras en Bluetooth y notificaciones';
++
++  @override
++  String get settingsNotificationLyricEnabledDesc =>
++      'Enviar letras sincronizadas a notificaciones y Bluetooth del coche. Desactivar si el coche tiene lag';
++
+   @override
+   String get settingsNotificationLyricInTitleTitle =>
+       'Letras en el título de la notificación';
+diff --git a/lib/l10n/app_localizations_zh.dart b/lib/l10n/app_localizations_zh.dart
+index 7b5a43a..5af5650 100644
+--- a/lib/l10n/app_localizations_zh.dart
++++ b/lib/l10n/app_localizations_zh.dart
+@@ -3348,6 +3348,13 @@ class AppLocalizationsZh extends AppLocalizations {
+   @override
+   String get settingsAutoEnterLyricsOnLaunchDesc => '启动客户端后自动进入全屏歌词界面（按屏幕自动适配）';
+ 
++  @override
++  String get settingsNotificationLyricEnabledTitle => '车载蓝牙与系统通知歌词';
++
++  @override
++  String get settingsNotificationLyricEnabledDesc =>
++      '向通知栏及连接的车载蓝牙等设备实时推送歌词。若连接车机播放时歌词卡顿，请保持关闭';
++
+   @override
+   String get settingsNotificationLyricInTitleTitle => '通知栏歌词占用标题行';
+ 
+diff --git a/lib/l10n/app_zh.arb b/lib/l10n/app_zh.arb
+index 3f3d69d..8d3ebce 100644
+--- a/lib/l10n/app_zh.arb
++++ b/lib/l10n/app_zh.arb
+@@ -2214,6 +2214,8 @@
+   "settingsFontScaleExtraLarge": "特大",
+   "settingsAutoEnterLyricsOnLaunchTitle": "打开后自动进入歌词",
+   "settingsAutoEnterLyricsOnLaunchDesc": "启动客户端后自动进入全屏歌词界面（按屏幕自动适配）",
++  "settingsNotificationLyricEnabledTitle": "车载蓝牙与系统通知歌词",
++  "settingsNotificationLyricEnabledDesc": "向通知栏及连接的车载蓝牙等设备实时推送歌词。若连接车机播放时歌词卡顿，请保持关闭",
+   "settingsNotificationLyricInTitleTitle": "通知栏歌词占用标题行",
+   "settingsNotificationLyricInTitleDesc": "开启：标题行显示歌词、歌名归副标题；关闭：标题行显示歌名、副标题显示歌词",
+   "settingsDesktopLyricTitle": "桌面歌词",
